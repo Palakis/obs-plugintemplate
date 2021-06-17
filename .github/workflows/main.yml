@@ -1,0 +1,370 @@
+name: 'BUILD'
+
+on:
+  push:
+    paths-ignore: ['**.md']
+    branches: [master]
+    tags: ['*']
+  pull_request:
+    paths-ignore: ['**.md']
+    branches: [master]
+
+env:
+  OBS_VERSION: '26.1.2'
+  PRODUCT_NAME: 'obs-plugin'
+  QT_VERSION_MAC: '5.15.2'
+  QT_VERSION_WIN: '5.15.2'
+  DEPS_VERSION_MAC: '2021-02-28'
+  DEPS_VERSION_WIN: '2019'
+
+jobs:
+  clang_check:
+    name: '01 - Code Format Check'
+    runs-on: [ubuntu-latest]
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          submodules: 'recursive'
+
+      - name: 'Install clang-format'
+        run: sudo apt-get install -y clang-format-10
+
+      - name: 'Run clang-format'
+        run: |
+          ./CI/formatcode.sh
+          ./CI/check-format.sh
+
+  macos_build:
+    name: '02 - macOS (Latest)'
+    runs-on: [macos-latest]
+    if: always()
+    needs: [clang_check]
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '10.13'
+      BLOCKED_FORMULAS: 'speexdsp curl php'
+      SIGN_IDENTITY: ''
+      HAVE_CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_APPLICATION_IDENTITY != '' && secrets.MACOS_SIGNING_INSTALLER_IDENTITY && secrets.MACOS_SIGNING_CERT != '' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          path: 'plugin'
+          submodules: 'recursive'
+
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          repository: 'obsproject/obs-studio'
+          path: 'obs-studio'
+          ref: '${{ env.OBS_VERSION }}'
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: 'Check for Github Labels'
+        if: github.event_name == 'pull_request'
+        run: |
+          LABELS_URL="$(echo ${{ github.event.pull_request.url }} | sed s'/pulls/issues/')"
+          LABEL_FOUND="$(curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "${LABELS_URL}/labels" | sed -n 's/.*"name": "\(.*\)",/\1/p' | grep 'Seeking Testers' || true)"
+          if [ "${LABEL_FOUND}" = "Seeking Testers" ]; then
+            echo "SEEKING_TESTERS=1" >> $GITHUB_ENV
+          else
+            echo "SEEKING_TESTERS=0" >> $GITHUB_ENV
+          fi
+
+      - name: "Install Dependencies"
+        working-directory: 'plugin'
+        run: |
+          REMOVE_FORMULAS=""
+          for FORMULA in ${{ env.BLOCKED_FORMULAS }}; do
+            if [ -d "/usr/local/opt/${FORMULA}" ]; then
+              REMOVE_FORMULAS="${REMOVE_FORMULAS}${FORMULA} "
+            fi
+          done
+
+          if [ -n "${REMOVE_FORMULAS}" ]; then
+            brew uninstall ${REMOVE_FORMULAS}
+          fi
+
+          CI/macos/01_install_dependencies.sh --standalone
+
+      - name: 'Restore libobs and obs-frontend-api from cache'
+        id: libobs-cache
+        uses: actions/cache@v2.1.2
+        env:
+          CACHE_NAME: 'libobs-cache'
+        with:
+          path: |
+            ${{ github.workspace }}/.cmake/packages/libobs
+            ${{ github.workspace }}/.cmake/packages/obs-frontend-api
+            ${{ github.workspace }}/obs-studio/build/libobs
+            ${{ github.workspace }}/obs-studio/build/UI/obs-frontend-api
+          key: ${{ runner.os }}-pr-${{ env.CACHE_NAME }}-${{ env.OBS_VERSION }}
+
+      - name: 'Build libobs and obs-frontend-api'
+        if: steps.libobs-cache.outputs.cache-hit != 'true'
+        working-directory: 'plugin'
+        run: CI/macos/02_build_obs-libs.sh
+
+      - name: 'Install Apple Developer Certificate'
+        if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request' && env.HAVE_CODESIGN_IDENTITY == 'true'
+        uses: apple-actions/import-codesign-certs@253ddeeac23f2bdad1646faac5c8c2832e800071
+        with:
+          p12-file-base64: ${{ secrets.MACOS_SIGNING_CERT }}
+          p12-password: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+
+      - name: 'Set Signing Identity'
+        if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request' && env.HAVE_CODESIGN_IDENTITY == 'true'
+        run: |
+          echo "CODESIGN_IDENT=${{ secrets.MACOS_SIGNING_APPLICATION_IDENTITY }}" >> $GITHUB_ENV
+          echo "CODESIGN_IDENT_INSTALLER=${{ secrets.MACOS_SIGNING_INSTALLER_IDENTITY }}" >> $GITHUB_ENV
+
+      - name: 'Build plugin'
+        working-directory: 'plugin'
+        run: CI/macos/03_build_plugin.sh --codesign
+
+      - name: 'Create build artifact'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        working-directory: 'plugin'
+        run: CI/macos/04_package_plugin.sh --codesign
+
+      - name: 'Upload build Artifact'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        uses: actions/upload-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-macos'
+          path: '${{ github.workspace }}/plugin/*-macOS.pkg'
+
+  linux_build:
+    name: '02 - Linux (Ubuntu, 20.04)'
+    runs-on: [ubuntu-latest]
+    if: always()
+    needs: [clang_check]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          path: 'plugin'
+          submodules: 'recursive'
+
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          repository: 'obsproject/obs-studio'
+          path: 'obs-studio'
+          ref: '${{ env.OBS_VERSION }}'
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: 'Check for Github Labels'
+        if: github.event_name == 'pull_request'
+        run: |
+          LABELS_URL="$(echo ${{ github.event.pull_request.url }} | sed s'/pulls/issues/')"
+          LABEL_FOUND="$(curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "${LABELS_URL}/labels" | sed -n 's/.*"name": "\(.*\)",/\1/p' | grep 'Seeking Testers' || true)"
+          if [ "${LABEL_FOUND}" = "Seeking Testers" ]; then
+            echo "SEEKING_TESTERS=1" >> $GITHUB_ENV
+          else
+            echo "SEEKING_TESTERS=0" >> $GITHUB_ENV
+          fi
+
+      - name: "Install Dependencies"
+        working-directory: 'plugin'
+        run: CI/linux/01_install_dependencies.sh
+
+      - name: 'Restore libobs and obs-frontend-api from cache'
+        id: libobs-cache
+        uses: actions/cache@v2.1.2
+        env:
+          CACHE_NAME: 'libobs-cache'
+        with:
+          path: |
+            ${{ github.workspace }}/.cmake/packages/libobs
+            ${{ github.workspace }}/.cmake/packages/obs-frontend-api
+            ${{ github.workspace }}/obs-studio/CI_BUILD/libobs
+            ${{ github.workspace }}/obs-studio/CI_BUILD/UI/obs-frontend-api
+          key: ${{ runner.os }}-pr-${{ env.CACHE_NAME }}-${{ env.OBS_VERSION }}
+
+      - name: 'Build libobs and obs-frontend-api'
+        if: steps.libobs-cache.outputs.cache-hit != 'true'
+        working-directory: 'plugin'
+        run: CI/linux/02_build_obs-libs.sh
+
+      - name: 'Build plugin'
+        working-directory: 'plugin'
+        run: CI/linux/03_build_plugin.sh
+
+      - name: 'Create build artifact'
+        working-directory: 'plugin'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        run: CI/linux/04_package_plugin.sh
+
+      - name: 'Upload build Artifact'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        uses: actions/upload-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-linux-${{ matrix.arch }}'
+          path: '${{ github.workspace }}/plugin/*.deb'
+
+  windows_build:
+    name: '02 - Windows (Latest)'
+    runs-on: [windows-latest]
+    needs: [clang_check]
+    if: always()
+    strategy:
+      matrix:
+        arch: [64, 32]
+    env:
+      CMAKE_GENERATOR: "Visual Studio 16 2019"
+      CMAKE_SYSTEM_VERSION: "10.0.18363.657"
+    steps:
+      - name: 'Add msbuild to PATH'
+        uses: microsoft/setup-msbuild@v1.0.2
+
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          path: 'plugin'
+          submodules: 'recursive'
+
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          repository: 'obsproject/obs-studio'
+          path: 'obs-studio'
+          ref: '${{ env.OBS_VERSION }}'
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - name: 'Check for Github Labels'
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          LABELS_URL="$(echo ${{ github.event.pull_request.url }} | sed s'/pulls/issues/')"
+          LABEL_FOUND="$(curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" "${LABELS_URL}/labels" | sed -n 's/.*"name": "\(.*\)",/\1/p' | grep 'Seeking Testers' || true)"
+          if [ "${LABEL_FOUND}" = "Seeking Testers" ]; then
+            echo "SEEKING_TESTERS=1" >> $GITHUB_ENV
+          else
+            echo "SEEKING_TESTERS=0" >> $GITHUB_ENV
+          fi
+
+      - name: "Install Dependencies"
+        working-directory: 'plugin'
+        run: CI/windows/01_install_dependencies.ps1 -Standalone
+
+      - name: 'Restore libobs and obs-frontend-api from cache'
+        id: libobs-cache
+        uses: actions/cache@v2.1.2
+        env:
+          CACHE_NAME: 'libobs-cache'
+        with:
+          path: |
+            ${{ github.workspace }}/obs-studio/build/libobs
+            ${{ github.workspace }}/obs-studio/build/UI/obs-frontend-api
+            ${{ github.workspace }}/obs-studio/build/deps/w32-pthreads
+          key: ${{ runner.os }}-pr-${{ env.CACHE_NAME }}-${{ env.OBS_VERSION }}
+
+      - name: 'Build libobs and obs-frontend-api'
+        working-directory: 'obs-studio'
+        run: CI/windows/02_build_obs-libs.ps1 -BuildArch "${{ matrix.arch }}-bit"
+
+      - name: 'Build plugin'
+        working-directory: 'plugin'
+        run: CI/windows/03_build_plugin.ps1 -BuildArch "${{ matrix.arch }}-bit"
+
+      - name: 'Create build artifact'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        run: CI/windows/04_package_plugin.ps1 -BuildArch "${{ matrix.arch }}-bit"
+
+      - name: 'Upload build Artifact'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        uses: actions/upload-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-windows-${{ matrix.arch }}'
+          path: '${{ github.workspace }}/plugin/*-Win${{ matrix.arch }}.zip'
+
+  windows_package:
+    name: '03 - Windows Installer'
+    runs-on: [ubuntu-latest]
+    needs: [windows_build]
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          submodules: 'recursive'
+
+      - name: 'Download 64-bit artifact'
+        uses: actions/download-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-windows-64'
+          path: ${{ github.workspace }}
+
+      - name: 'Download 32-bit artifact'
+        uses: actions/download-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-windows-32'
+          path: ${{ github.workspace }}
+
+      - name: 'Build InnoSetup installer'
+        run: |
+          Get-ChildItem -Filter "*-Win32.zip" -File | Expand-Archive -DestinationPath ./release/
+          Get-ChildItem -Filter "*-Win64.zip" -File | Expand-Archive -DestinationPath ./release/
+          CI/windows/04_package_plugin.ps1 -BuildInstaller -CombinedArchs
+
+      - name: 'Upload build Artifact'
+        if: success() && (github.event_name != 'pull_request' || env.SEEKING_TESTERS == '1')
+        uses: actions/upload-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-windows-release'
+          path: '${{ github.workspace }}/plugin/*-Windows-Installer.exe'
+
+  macos_release:
+    name: '03 - macOS notarized image'
+    runs-on: [macos-latest]
+    needs: [macos_build]
+    env:
+      HAVE_CODESIGN_IDENTITY: ${{ secrets.MACOS_SIGNING_APPLICATION_IDENTITY != '' && secrets.MACOS_SIGNING_INSTALLER_IDENTITY && secrets.MACOS_SIGNING_CERT != '' }}
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name != 'pull_request'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 'Check Codesigning identity'
+        run: test "${HAVE_CODESIGN_IDENTITY}" = "true"
+
+      - name: 'Checkout'
+        uses: actions/checkout@v2.3.3
+        with:
+          submodules: 'recursive'
+
+      - name: 'Download artifact'
+        uses: actions/download-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-macos'
+
+      - name: 'Install Apple Developer Certificate'
+        uses: apple-actions/import-codesign-certs@253ddeeac23f2bdad1646faac5c8c2832e800071
+        with:
+          p12-file-base64: ${{ secrets.MACOS_SIGNING_CERT }}
+          p12-password: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+
+      - name: 'Install prerequisite XCNotary'
+        run: brew bundle --file CI/include/Xcnotary
+
+      - name: 'Create disk image for distribution'
+        env:
+          CODESIGN_IDENT_USER: '${{ secrets.MACOS_NOTARIZATION_USERNAME }}'
+          CODESIGN_IDENT_PASS: '${{ secrets.MACOS_NOTARIZATION_PASSWORD }}'
+        run: CI/macos/04_package_plugin.sh --notarize
+
+      - name: 'Upload notarized installer package'
+        uses: actions/upload-artifact@v2
+        with:
+          name: '${{ env.PRODUCT_NAME }}-macos-release'
+          path: '${{ github.workspace }}/plugin/*-macOS.pkg'
